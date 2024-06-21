@@ -1,0 +1,294 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import json
+import argparse
+import re
+from openai import OpenAI
+
+# Constants
+KEY_FILE_PATH = os.path.expanduser('~/.openai/master.key')  # Path to the API key
+ASSISTANT_ID = 'asst_AOZDyu4MPYlFawc2G8bGc9Xv'  # ID of the assistant
+THREAD_DIR = 'AI_THREAD'  # Directory to store the thread information
+THREAD_FILE = os.path.join(THREAD_DIR, 'thread')  # Thread file path
+FILE_TYPES = ('.cpp', '.h', '.py', 'Makefile', 'Dockerfile', '.sh', '.js', '.html', '.sql', '.json', 'README.md', '.yaml')
+
+# File types dictionary for different categories
+FILE_DICT = {
+    "C++": ['.cpp', '.h'],
+    "Python": ['.py'],
+    "Build Systems": ['Makefile'],
+    "Containerization": ['Dockerfile', 'compose.yml'],
+    "Shell Scripts": ['.sh'],
+    "JavaScript": ['.js'],
+    "HTML": ['.html'],
+    "SQL": ['.sql'],
+    "JSON": ['.json'],
+    "Documentation": ['README.md'],
+    "Configuration": ['.yaml']
+}
+
+# Assemble the extensions into a single tuple
+FILE_TYPES = tuple(ext for extensions in FILE_DICT.values() for ext in extensions)
+
+# List of directories to ignore
+IGNORED_DIRS = [THREAD_DIR]
+
+def read_first_line(filename):
+    """
+    Reads the first line from a file and returns it.
+    
+    Args:
+        filename (str): Path to the file.
+        
+    Returns:
+        str: The first line of the file.
+    """
+    with open(filename, 'r') as f:
+        return f.readline().strip()
+
+def create_openai_client(api_key):
+    """
+    Creates and returns an OpenAI client using the provided API key.
+    
+    Args:
+        api_key (str): API key for OpenAI.
+        
+    Returns:
+        OpenAI: OpenAI client instance.
+    """
+    return OpenAI(api_key=api_key)
+
+def get_or_create_thread_id(client):
+    """
+    Gets or creates and returns the thread ID.
+    
+    Args:
+        client (OpenAI): OpenAI client instance.
+        
+    Returns:
+        str: The thread ID.
+    """
+    if not os.path.exists(THREAD_DIR):
+        os.makedirs(THREAD_DIR)
+
+    if os.path.exists(THREAD_FILE):
+        with open(THREAD_FILE, 'r') as thread_file:
+            thread_data = json.load(thread_file)
+        print(f"Using existing thread: {thread_data['id']}")
+        return thread_data['id']
+
+    thread_data = client.beta.threads.create().to_dict()
+    with open(THREAD_FILE, 'w') as thread_file:
+        json.dump(thread_data, thread_file, indent=4)
+    print(f"Created new thread: {thread_data['id']}")
+    return thread_data['id']
+
+def send_message(client, thread_id, message_content):
+    """
+    Sends a message to the specified thread.
+    
+    Args:
+        client (OpenAI): OpenAI client instance.
+        thread_id (str): ID of the thread.
+        message_content (str): Message content to send.
+    """
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=message_content
+    )
+
+def create_gen_files_directory(base_dir=THREAD_DIR):
+    """
+    Creates a new GEN_FILES directory with an incremental numeric suffix.
+    
+    Args:
+        base_dir (str): Base directory for the new GEN_FILES directory.
+        
+    Returns:
+        str: Path to the new GEN_FILES directory.
+    """
+    existing_gen_dirs = [name for name in os.listdir(base_dir) if name.startswith('GEN_FILES_')]
+    new_dir_index = len(existing_gen_dirs) + 1
+    new_gen_dir = os.path.join(base_dir, f'GEN_FILES_{new_dir_index}')
+    os.makedirs(new_gen_dir)
+    return new_gen_dir
+
+def extract_and_save_generated_files(gen_file_content, base_dir=THREAD_DIR):
+    """
+    Extracts file contents from the generated response and saves them in the new directory.
+    
+    Args:
+        gen_file_content (str): Content received from OpenAI containing file data.
+        base_dir (str): Base directory where GEN_FILES directory will be created.
+    """
+    new_gen_dir = create_gen_files_directory(base_dir)
+    pattern_start = 'GEN_NEW_FILE'
+    pattern_end = 'END_GEN_FILE'
+    file_pattern = re.compile(r'{}```(.*?)\n(.*?)```{}'.format(pattern_start, pattern_end), re.DOTALL)
+
+    for match in file_pattern.finditer(gen_file_content):
+        file_info, content = match.groups()
+        file_path = os.path.join(new_gen_dir, file_info.strip())
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w') as file:
+            file.write(content.strip())
+    print(f"Generated files saved in {new_gen_dir}")
+
+def execute_assistant(client, thread_id, assistant_id):
+    """
+    Executes the assistant and prints the result.
+    
+    Args:
+        client (OpenAI): OpenAI client instance.
+        thread_id (str): ID of the thread.
+        assistant_id (str): ID of the assistant.
+    """
+    run_instance = client.beta.threads.runs.create_and_poll(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+    )
+    print(f"Run completed with status: {run_instance.status}")
+
+    if run_instance.status == "completed":
+        messages = client.beta.threads.messages.list(thread_id=thread_id)
+        response = messages.data[0].content[0].text.value
+        print(response)
+
+        # Save the response content to appropriate files
+        extract_and_save_generated_files(response)
+
+def run_pipeline(message):
+    """
+    Runs the entire pipeline of reading the key, creating a client, sending a message, and executing the assistant.
+    
+    Args:
+        message (str): The message to be processed and sent to the assistant.
+    """
+    api_key = read_first_line(KEY_FILE_PATH)
+    client = create_openai_client(api_key)
+    thread_id = get_or_create_thread_id(client)
+    send_message(client, thread_id, message)
+    execute_assistant(client, thread_id, ASSISTANT_ID)
+
+def format_file_content(file_path, file_type):
+    """
+    Formats the content of the specified file for message sending.
+    
+    Args:
+        file_path (str): Path to the file.
+        file_type (str): Type of the file.
+        
+    Returns:
+        str: Formatted file content.
+    """
+    with open(file_path, 'r') as file:
+        return f'```{file_type}: {file_path}\n{file.read()}```'
+
+def save_user_message(message):
+    """
+    Saves the user's message to a file in the AI_THREAD directory.
+    
+    Args:
+        message (str): The message content to save.
+    """
+    message_num = len([name for name in os.listdir(THREAD_DIR) if name.startswith('user_message_')]) + 1
+    message_file_path = os.path.join(THREAD_DIR, f'user_message_{message_num}')
+    with open(message_file_path, 'w') as message_file:
+        message_file.write(message)
+
+def gather_files_from_directory(directory, recursive=False):
+    """
+    Gathers and returns a list of files matching the criteria from the given directory.
+    
+    Args:
+        directory (str): Path to the directory.
+        recursive (bool): If True, gathers files recursively.
+        
+    Returns:
+        list: List of matching file paths.
+    """
+    matched_files = []
+    for root, _, files in os.walk(directory):
+        if not any(ignored_dir in root for ignored_dir in IGNORED_DIRS):
+            for file in files:
+                if file.endswith(FILE_TYPES):
+                    matched_files.append(os.path.join(root, file))
+        if not recursive:
+            break
+    return matched_files
+
+def ensure_directory_exists(directory):
+    """
+    Ensures the specified directory exists, creating it if necessary.
+    
+    Args:
+        directory (str): Path to the directory.
+    """
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def build_complete_message(message, focus_file_path=None, context_file_path=None, external_files=None):
+    """
+    Constructs the complete message by including context, focus file, and external files.
+    
+    Args:
+        message (str): Main task message.
+        focus_file_path (str): Path to the focus file.
+        context_file_path (str): Path to the context file.
+        external_files (list): List of external file paths.
+        
+    Returns:
+        str: Complete formatted message.
+    """
+    context_content = format_file_content(context_file_path, 'CONTEXT') if context_file_path else ""
+    focus_file_content = format_file_content(focus_file_path, 'FOCUSFILE') if focus_file_path else ""
+    external_files_content = "\n\n".join([format_file_content(file, 'EXTERNAL') for file in external_files]) if external_files else ""
+
+    return f"{context_content}\n\n{external_files_content}\n\n{focus_file_content}\n\nMAINTASK: {message}".strip()
+
+def main():
+    """
+    Main function to parse arguments and execute the script.
+    """
+    parser = argparse.ArgumentParser(description='Process files and send a message to the OpenAI Assistant.')
+
+    parser.add_argument('-ff', '--focus_file', type=str,
+                        help='Specify the primary focus file. The content of this file will be included and highlighted in the message.')
+    parser.add_argument('-m', '--message', type=str, required=True,
+                        help='The main message to be sent to the assistant.')
+    parser.add_argument('-x', '--external_files', type=str, action='append', 
+                        help='Specify an external file to be included in the message. Can be used multiple times to specify multiple files.')
+    parser.add_argument('-xd', '--external_dirs', type=str, nargs='*',
+                        help='List of directories containing external *.cpp, *.h, or *.py files to be included in the message.')
+    parser.add_argument('-xr', '--external_dirs_recursive', type=str, nargs='*',
+                        help='List of directories to recursively add all matching files to the message.')
+    parser.add_argument('-c', '--context', type=str,
+                        help='A file containing the bigger picture context for the project.')
+
+    args = parser.parse_args()
+
+    ensure_directory_exists(THREAD_DIR)
+
+    external_files = args.external_files if args.external_files else []
+
+    if args.external_dirs:
+        for directory in args.external_dirs:
+            external_files.extend(gather_files_from_directory(directory))
+
+    if args.external_dirs_recursive:
+        for directory in args.external_dirs_recursive:
+            external_files.extend(gather_files_from_directory(directory, recursive=True))
+
+    if args.focus_file and args.focus_file in external_files:
+        external_files.remove(args.focus_file)
+
+    complete_message = build_complete_message(args.message, args.focus_file, args.context, external_files)
+    save_user_message(complete_message)
+
+    run_pipeline(complete_message)
+
+if __name__ == '__main__':
+    main()
